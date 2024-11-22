@@ -7,7 +7,7 @@ pub fn get_header(headers: &[httparse::Header], target: &str) -> Option<String> 
     None
 }
 
-pub fn new_headers<'a>(headers: &'a Vec<(String, String)>) -> Vec<httparse::Header<'a>> {
+pub fn new_headers<'a>(headers: &'a Vec<(&'a str, &'a str)>) -> Vec<httparse::Header<'a>> {
     headers
         .iter()
         .map(|(key, value)| httparse::Header {
@@ -17,7 +17,7 @@ pub fn new_headers<'a>(headers: &'a Vec<(String, String)>) -> Vec<httparse::Head
         .collect::<Vec<httparse::Header>>()
 }
 
-pub fn response_to_bytes(response: httparse::Response, body: Option<String>) -> Vec<u8> {
+pub fn response_to_bytes<T: AsRef<[u8]>>(response: httparse::Response, body: Option<T>) -> Vec<u8> {
     let code = format!(
         "HTTP/1.1 {} {}\n",
         response.code.unwrap(),
@@ -40,7 +40,22 @@ pub fn response_to_bytes(response: httparse::Response, body: Option<String>) -> 
     let headers = headers.concat();
     let mut response = vec![code, headers];
     if let Some(body) = body {
-        response.push(body.as_bytes().to_vec());
+        response.push("\n".as_bytes().to_vec());
+        response.push(body.as_ref().to_vec());
     }
     response.concat()
+}
+
+pub fn get_request_body(request: String) -> String {
+    let mut flag = false;
+    let mut content = Vec::new();
+    for line in request.lines() {
+        if flag {
+            content.push(line);
+        }
+        if line.trim().is_empty() {
+            flag = true;
+        }
+    }
+    content.join("\n")
 }
