@@ -1,7 +1,7 @@
 use crate::modules::database::types::*;
 use crate::modules::web_client::{client::WebClient, http::*, types::*};
 use serde_json::json;
-use sha2::{Digest, Sha256, Sha512};
+use sha2::Digest;
 use std::{
     io::{ErrorKind, Read, Write},
     net::{TcpListener, TcpStream},
@@ -86,25 +86,27 @@ impl WebConnection {
     }
 
     fn handle_request(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        if self.handle_cors(request) {
-            return;
-        }
-        if let Some(path) = request.path {
-            let slice = path.split("/").collect::<Vec<&str>>();
-            if let Some(path) = slice.get(1) {
-                match *path {
-                    "chat" => self.get_chat(request),
-                    "new_chat" => self.new_chat(request),
-                    "new_message" => self.send_message(request, data),
-                    "login" => self.login(request, data),
-                    "chats" => self.get_chats(request),
-                    "delete_chat" => self.delete_chat(request, data),
-                    "register" => self.register_user(request, data),
-                    "audio" => self.get_audio(request, data),
-                    _ => self.handle_invalid_endpoint(),
+        if let Some(method) = request.method {
+            if self.handle_cors(request) {
+                return;
+            }
+            if let Some(path) = request.path {
+                let slice = path.split("/").collect::<Vec<&str>>();
+                if let Some(path) = slice.get(1) {
+                    match format!("{method} {path}").as_str() {
+                        "GET chat" => self.get_chat(request),
+                        "POST new_chat" => self.new_chat(request),
+                        "POST new_message" => self.send_message(request, data),
+                        "POST login" => self.login(request, data),
+                        "GET chats" => self.get_chats(request),
+                        "DELETE delete_chat" => self.delete_chat(request, data),
+                        "POST register" => self.register_user(request, data),
+                        "GET audio" => self.get_audio(request, data),
+                        _ => self.handle_invalid_endpoint(),
+                    }
+                } else {
+                    self.generic_error(400, "Bad Request");
                 }
-            } else {
-                self.generic_error("Invalid Path".into());
             }
         }
     }
@@ -139,13 +141,13 @@ impl WebConnection {
                             let response = response_to_bytes(response, Some(data));
                             let _ = self.stream.write_all(&response);
                         }
-                        _ => self.generic_error("Invalid Message ID".into()),
+                        _ => self.generic_error(403, "Forbidden"),
                     }
                 }
-                _ => self.generic_error("Invalid Token".into()),
+                _ => self.generic_error(401, "Unauthorized"),
             }
         } else {
-            self.generic_error("No token provided".into());
+            self.generic_error(400, "Bad Request");
         }
     }
 
@@ -172,40 +174,42 @@ impl WebConnection {
         let body = String::from_utf8_lossy(data);
         let credentials = get_request_body(body.to_string());
         let slice = credentials.split("\n").collect::<Vec<&str>>();
-        if let Some(email) = slice.get(0) {
-            let email = email.trim();
-            if let Some(password) = slice.get(1) {
-                let password = password.trim();
-                if email.trim().len() < 2 || password.trim().len() < 8 {
-                    self.generic_error("Invalid Credentials".into());
-                    return;
-                }
-                let _ = self.sender.send(NetworkMessage::RegisterUser(
-                    self.addr.clone(),
-                    email.to_string(),
-                    password.to_string(),
-                ));
-                let response = self.receiver.recv().unwrap();
-                match response {
-                    DatabaseMessage::Token(ref token) => {
-                        let headers = vec![
-                            ("Access-Control-Allow-Origin", "*"),
-                            ("Access-Control-Allow-Headers", "*"),
-                        ];
-                        let mut headers = new_headers(&headers);
-                        let mut response = httparse::Response::new(&mut headers);
-                        response.code = Some(200);
-                        response.reason = Some("OK");
-                        let response = response_to_bytes(response, Some(token.to_string()));
-                        let _ = self.stream.write_all(&response);
-                    }
-                    _ => self.generic_error("Invalid Credentials".into()),
-                }
-            } else {
-                self.generic_error("No password is present".into());
+        if slice.len() != 3 {
+            self.generic_error(400, "Bad Request");
+            return;
+        }
+        let name = slice[0];
+        let email = slice[1];
+        let password = slice[2];
+        let email = email.trim();
+        let password = password.trim();
+        if email.trim().len() < 2 || password.trim().len() < 8 {
+            self.generic_error(400, "Bad Request");
+            return;
+        }
+        let _ = self.sender.send(NetworkMessage::RegisterUser(
+            self.addr.clone(),
+            name.to_string(),
+            email.to_string(),
+            password.to_string(),
+        ));
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::Token(ref token) => {
+                let headers = vec![
+                    ("Access-Control-Allow-Origin", "*"),
+                    ("Access-Control-Allow-Headers", "*"),
+                ];
+                let mut headers = new_headers(&headers);
+                let mut response = httparse::Response::new(&mut headers);
+                response.code = Some(200);
+                response.reason = Some("OK");
+                let body = UserInfo::new(email.to_string(), name.to_string(), token.to_string());
+                let body = json!(body).to_string();
+                let response = response_to_bytes(response, Some(body));
+                let _ = self.stream.write_all(&response);
             }
-        } else {
-            self.generic_error("No credentials on request".into());
+            _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
@@ -232,10 +236,10 @@ impl WebConnection {
                     let response = response_to_bytes(response, None::<String>);
                     let _ = self.stream.write_all(&response);
                 }
-                _ => self.generic_error(None),
+                _ => self.generic_error(404, "Not Found"),
             }
         } else {
-            self.generic_error(None);
+            self.generic_error(400, "Bad Request");
         }
     }
 
@@ -248,6 +252,7 @@ impl WebConnection {
             let headers = vec![
                 ("Access-Control-Allow-Origin", "*"),
                 ("Access-Control-Allow-Headers", "*"),
+                ("Access-Control-Allow-Methods", "*"),
             ];
             let mut headers = new_headers(&headers);
             let mut response = httparse::Response::new(&mut headers);
@@ -287,13 +292,13 @@ impl WebConnection {
                             let response = response_to_bytes(response, Some(chats));
                             let _ = self.stream.write(&response);
                         }
-                        _ => self.generic_error("Db response is not messages".into()),
+                        _ => self.generic_error(500, "Internal Server Error"),
                     }
                 }
-                _ => self.generic_error("Db response was not email".into()),
+                _ => self.generic_error(401, "Unauthorized"),
             }
         } else {
-            self.generic_error("There is no token header".into());
+            self.generic_error(400, "Bad Request");
         }
     }
 
@@ -304,41 +309,40 @@ impl WebConnection {
             .split("\n")
             .filter(|x| !x.is_empty())
             .collect::<Vec<&str>>();
-        if let Some(email) = slice.get(0) {
-            if let Some(password) = slice.get(1) {
-                let mut hasher = sha2::Sha256::new();
-                hasher.update(password.trim());
-                let finalized = &hasher.finalize();
-                let password_hash = hex::encode(finalized);
+        if slice.len() != 2 {
+            self.generic_error(400, "Bad Request");
+            return;
+        }
+        let email = slice[0];
+        let password = slice[1];
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(password.trim());
+        let finalized = &hasher.finalize();
+        let password_hash = hex::encode(finalized);
 
-                let _ = self.sender.send(NetworkMessage::LoginRequest(
-                    self.addr.clone(),
-                    email.to_string(),
-                    password_hash.to_string(),
-                ));
-                let response = self.receiver.recv().unwrap();
-                match response {
-                    DatabaseMessage::Token(token) => {
-                        let token = format!("Token={token}");
-                        let headers = vec![
-                            ("Access-Control-Allow-Origin", "*"),
-                            ("Access-Control-Expose-Headers", "*"),
-                            ("Cookie", &token),
-                        ];
-                        let mut headers = new_headers(&headers);
-                        let mut response = httparse::Response::new(&mut headers);
-                        response.code = Some(200);
-                        response.reason = Some("OK");
-                        let response = response_to_bytes(response, None::<String>);
-                        let _ = self.stream.write_all(&response);
-                    }
-                    _ => self.generic_error("Invalid Credentials".into()),
-                }
-            } else {
-                self.generic_error("No password".into());
+        let _ = self.sender.send(NetworkMessage::LoginRequest(
+            self.addr.clone(),
+            email.to_string(),
+            password_hash.to_string(),
+        ));
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::UserInfo(ref info) => {
+                let token = format!("Token={}", info.token);
+                let headers = vec![
+                    ("Access-Control-Allow-Origin", "*"),
+                    ("Access-Control-Expose-Headers", "*"),
+                    ("Cookie", &token),
+                ];
+                let mut headers = new_headers(&headers);
+                let mut response = httparse::Response::new(&mut headers);
+                response.code = Some(200);
+                response.reason = Some("OK");
+                let body = json!(info).to_string();
+                let response = response_to_bytes(response, Some(body));
+                let _ = self.stream.write_all(&response);
             }
-        } else {
-            self.generic_error("No email".into());
+            _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
@@ -368,22 +372,22 @@ impl WebConnection {
                             let response = response_to_bytes(response, Some(id));
                             let _ = self.stream.write(&response);
                         }
-                        _ => self.generic_error("Db response is not messages".into()),
+                        _ => self.generic_error(403, "Forbidden"),
                     }
                 }
-                _ => self.generic_error("Db response was not email".into()),
+                _ => self.generic_error(401, "Unauthorized"),
             }
         } else {
-            self.generic_error("There is no token header".into());
+            self.generic_error(400, "Bad Request");
         }
     }
 
-    fn generic_error(&mut self, reason: Option<&str>) {
+    fn generic_error(&mut self, code: u16, reason: &str) {
         let headers = vec![("Access-Control-Allow-Origin", "*")];
         let mut headers = new_headers(&headers);
         let mut response = httparse::Response::new(&mut headers);
-        response.code = Some(400);
-        response.reason = reason;
+        response.code = Some(code);
+        response.reason = Some(reason);
         let response = response_to_bytes(response, None::<String>);
         let _ = self.stream.write_all(&response);
     }
@@ -418,13 +422,13 @@ impl WebConnection {
                         let response = response_to_bytes(response, Some(body));
                         let _ = self.stream.write_all(&response);
                     }
-                    _ => self.generic_error("Invalid chat id".into()),
+                    _ => self.generic_error(403, "Forbidden"),
                 }
             } else {
-                self.generic_error("Unauthorized".into());
+                self.generic_error(401, "Unauthorized");
             }
         } else {
-            self.generic_error("Invalid URI".into());
+            self.generic_error(400, "Bad Request");
         }
     }
 
@@ -436,7 +440,7 @@ impl WebConnection {
             if let Some(token) = token {
                 let content = get_request_body(String::from_utf8_lossy(data).to_string());
                 if content.trim().len() < 1 {
-                    self.generic_error("Empty message".into());
+                    self.generic_error(400, "Bad Request");
                     return;
                 }
                 let _ = self.sender.send(NetworkMessage::NewMessage(
@@ -473,7 +477,7 @@ impl WebConnection {
                             ));
                             self.receiver.recv().unwrap();
                         } else {
-                            self.generic_error("API request blocked".into());
+                            self.generic_error(502, "Bad Gateway");
                             return;
                         }
                         let body = json!(WebMessage::new(copy, timestamp, id)).to_string();
@@ -490,18 +494,18 @@ impl WebConnection {
                         let response = response_to_bytes(response, Some(body));
                         let _ = self.stream.write_all(&response);
                     }
-                    _ => self.generic_error("Invalid chat id".into()),
+                    _ => self.generic_error(403, "Forbidden"),
                 }
             } else {
-                self.generic_error("Unauthorized".into());
+                self.generic_error(401, "Unauthorized");
             }
         } else {
-            self.generic_error("No chat id provided".into());
+            self.generic_error(400, "Bad Request");
         }
     }
 
     fn handle_invalid_endpoint(&mut self) {
-        self.generic_error("Not Found".into());
+        self.generic_error(404, "Not Found");
     }
 
     fn retrieve_messages(&self, token: &str, chat_id: &str) -> Option<Messages> {

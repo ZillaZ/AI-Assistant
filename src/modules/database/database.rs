@@ -1,8 +1,8 @@
 use crate::modules::{
     database::types::*,
-    web_client::types::{Message, WebMessage},
+    web_client::types::{Message, UserInfo, WebMessage},
 };
-use sha2::{Digest, Sha256, Sha512};
+use sha2::Digest;
 use sqlite::Connection;
 use std::{
     collections::HashMap,
@@ -57,12 +57,18 @@ impl DbConnection {
             match message {
                 NetworkMessage::LoginRequest(ref id, ref email, ref password_hash) => {
                     let sender = self.senders.get(id).unwrap();
-                    let message =
-                        if let Some(token) = self.validate_connection(email, password_hash) {
-                            DatabaseMessage::Token(token)
+                    let message = if let Some(token) =
+                        self.validate_connection(email, password_hash)
+                    {
+                        let name = self.get_user_name(email);
+                        if let Some(name) = name {
+                            DatabaseMessage::UserInfo(UserInfo::new(email.to_string(), name, token))
                         } else {
                             DatabaseMessage::Err
-                        };
+                        }
+                    } else {
+                        DatabaseMessage::Err
+                    };
                     let _ = sender.send(message);
                 }
                 NetworkMessage::TokenValidation(ref id, ref token) => {
@@ -125,13 +131,13 @@ impl DbConnection {
                         let _ = sender.send(DatabaseMessage::Err);
                     }
                 }
-                NetworkMessage::RegisterUser(ref id, ref email, ref password) => {
+                NetworkMessage::RegisterUser(ref id, ref name, ref email, ref password) => {
                     let sender = self.senders.get(id).unwrap();
                     if self.user_exists(email) {
                         let _ = sender.send(DatabaseMessage::Err);
                         return;
                     }
-                    self.register_user(email, password);
+                    self.register_user(name, email, password);
                     let token = self.create_token(email);
                     let _ = sender.send(DatabaseMessage::Token(token));
                 }
@@ -159,6 +165,19 @@ impl DbConnection {
                 }
             }
         }
+    }
+
+    fn get_user_name(&self, email: &str) -> Option<String> {
+        let query = "select name from UserInfo where email = ?";
+        let mut statement = self.connection.prepare(query).unwrap();
+        statement.bind((1, email)).unwrap();
+        for result in statement.into_iter() {
+            if let Ok(row) = result {
+                let name = row.read::<&str, _>("name");
+                return Some(name.to_string());
+            }
+        }
+        None
     }
 
     fn record_audio_path(&self, message_id: &str, path: &str) {
@@ -237,12 +256,14 @@ impl DbConnection {
     }
 
     fn get_chat_messages(&self, email: &str, chat_id: &str) -> Vec<WebMessage> {
+        println!("{email} {chat_id}");
         let query =
             "select * from Messages where email = ? and chat_id = ? order by datetime limit 50";
         let mut statement = self.connection.prepare(query).unwrap();
         statement.bind_iter([(1, email), (2, chat_id)]).unwrap();
         let mut messages = Vec::new();
         for result in statement.into_iter() {
+            println!("has result");
             if let Ok(row) = result {
                 let sender = row.read::<&str, _>("sender");
                 let content = row.read::<&str, _>("content");
@@ -250,8 +271,11 @@ impl DbConnection {
                 let id = row.read::<&str, _>("id");
                 let message = Message::new(sender, content);
                 messages.push(WebMessage::new(message, timestamp as u64, id.to_string()));
+            } else {
+                println!("is not ok");
             }
         }
+        println!("{:?}", messages);
         messages
     }
 
@@ -360,7 +384,7 @@ impl DbConnection {
         statement.iter().count() == 1
     }
 
-    fn register_user(&self, email: &str, password: &str) {
+    fn register_user(&self, name: &str, email: &str, password: &str) {
         let mut sha = sha2::Sha256::new();
         sha.update(password);
         let password_hash = sha.finalize();
@@ -368,6 +392,10 @@ impl DbConnection {
         let query = "insert into Users values (?, ?)";
         let mut statement = self.connection.prepare(query).unwrap();
         statement.bind_iter([(1, email), (2, &hash)]).unwrap();
+        statement.iter().count();
+        let query = "insert into UserInfo values (?, ?)";
+        let mut statement = self.connection.prepare(query).unwrap();
+        statement.bind_iter([(1, email), (2, name)]).unwrap();
         statement.iter().count();
     }
 }

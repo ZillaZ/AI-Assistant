@@ -129,3 +129,16 @@ pub struct Error {
     r#type: String,
     message: String,
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct UserInfo {
+    pub token: String,
+    name: String,
+    email: String,
+}
+
+impl UserInfo {
+    pub fn new(email: String, name: String, token: String) -> Self {
+        Self { email, name, token }
+    }
+}

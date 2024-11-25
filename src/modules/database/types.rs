@@ -8,6 +8,7 @@ pub enum DatabaseMessage {
     Timestamp(u64),
     Message(String),
     AudioPath(String),
+    UserInfo(UserInfo),
     Ok,
     Err,
 }
@@ -20,7 +21,7 @@ pub enum NetworkMessage {
     NewMessage(String, String, String, String, String, String),
     GetChats(String, String),
     DeleteChat(String, String, String),
-    RegisterUser(String, String, String),
+    RegisterUser(String, String, String, String),
     GetMessage(String, String),
     GetAudioPath(String, String),
     RecordAudioPath(String, String),

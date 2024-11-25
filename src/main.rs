@@ -1,6 +1,6 @@
 use modules::{
     database::{database::DbConnection, types::*},
-    web_client::{server::WebServer, types::*},
+    web_client::server::WebServer,
 };
 use std::sync::mpsc::{channel, Receiver, Sender};
 
