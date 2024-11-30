@@ -36,6 +36,7 @@ impl WebServer {
         let mut listener = Server::bind("0.0.0.0:8080").expect("Unable to start WebSockets server");
         while let Ok(stream) = listener.accept() {
             if let Ok(client) = stream.accept() {
+                client.set_nonblocking(true).unwrap();
                 let (reader, writer) = client.split().unwrap();
                 println!("SUCCESS");
                 let addr = uuid::Uuid::new_v4().to_string();
@@ -81,12 +82,12 @@ impl WebConnection {
     }
 
     pub fn update(&mut self, mut reader: Reader<TcpStream>) {
-        for message in reader.incoming_messages() {
-            if let Ok(message) = message {
+        loop {
+            self.receive_messages();
+            if let Ok(message) = reader.recv_message() {
                 if let OwnedMessage::Text(data) = message {
                     let mut headers = [httparse::EMPTY_HEADER; 64];
                     let req = httparse::Request::new(&mut headers);
-                    //self.receive_messages();
                     self.handle_request(&req, &data);
                 }
             }
@@ -96,16 +97,16 @@ impl WebConnection {
     fn receive_messages(&mut self) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
-                DatabaseMessage::Message(message) => {
-                    let message = json!(SocketMessage::Message(message)).to_string();
+                DatabaseMessage::WebMessage(message) => {
+                    let message = json!(ServerResponse::Message(message)).to_string();
                     let _ = self.writer.send_message(&OwnedMessage::Text(message));
                 }
                 DatabaseMessage::Deleted(chat_id) => {
-                    let message = json!(SocketMessage::Deleted(chat_id)).to_string();
+                    let message = json!(ServerResponse::Deleted(chat_id)).to_string();
                     let _ = self.writer.send_message(&OwnedMessage::Text(message));
                 }
                 DatabaseMessage::NewChat(chat_id) => {
-                    let message = json!(SocketMessage::NewChat(chat_id)).to_string();
+                    let message = json!(ServerResponse::ChatId(chat_id)).to_string();
                     let _ = self.writer.send_message(&OwnedMessage::Text(message));
                 }
                 message => todo!("{:?}", message),
@@ -115,7 +116,6 @@ impl WebConnection {
 
     fn handle_request(&mut self, request: &httparse::Request, data: &str) {
         if let Ok(message) = serde_json::from_str::<ClientMessage>(data) {
-            println!("MESSAGE: {:?}", message);
             match message.body {
                 ClientMessageKind::Login(login) => {
                     self.login(login);
@@ -132,8 +132,6 @@ impl WebConnection {
                 ClientMessageKind::Register(register) => self.register_user(register),
                 ClientMessageKind::GetAudio(get_audio) => self.get_audio(get_audio),
             }
-        } else {
-            println!("not message: {data}");
         }
     }
 
@@ -284,9 +282,8 @@ impl WebConnection {
                 let message = NetworkMessage::NewChat(self.addr.clone(), email);
                 let _ = self.sender.send(message);
                 let response = self.receiver.recv().unwrap();
-                println!("RESPONSE IS {:?}", response);
                 match response {
-                    DatabaseMessage::Messages(id, _) => {
+                    DatabaseMessage::NewChat(id) => {
                         let response = ServerResponse::ChatId(id);
                         let response = json!(response).to_string();
                         let _ = self.writer.send_message(&OwnedMessage::Text(response));
@@ -315,7 +312,6 @@ impl WebConnection {
             get_chat.chat_id.to_string(),
         ));
         let response = self.receiver.recv().unwrap();
-        println!("RECEIVED INSIDE GET CHAT");
 
         match response {
             DatabaseMessage::Messages(ref _id, messages) => {

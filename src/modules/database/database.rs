@@ -84,17 +84,11 @@ impl DbConnection {
                         let _ = sender.send(DatabaseMessage::Err);
                     }
                 }
-                NetworkMessage::NewChat(ref id, ref email) => {
-                    let sender = self.senders.get(id).unwrap();
+                NetworkMessage::NewChat(ref _id, ref email) => {
                     let chat_id = self.new_chat(email);
-                    let _ = sender.send(DatabaseMessage::Messages(chat_id.clone(), Vec::new()));
                     if let Some(senders) = self.email_senders.get(email) {
-                        for (rid, sender) in senders {
-                            if rid == id {
-                                continue;
-                            }
-                            let _ =
-                                sender.send(DatabaseMessage::Messages(chat_id.clone(), Vec::new()));
+                        for (_rid, sender) in senders {
+                            let _ = sender.send(DatabaseMessage::NewChat(chat_id.clone()));
                         }
                     }
                 }
@@ -125,13 +119,14 @@ impl DbConnection {
                         let _ = sender.send(DatabaseMessage::Timestamp(timestamp));
                         if let Some(senders) = self.email_senders.get(email) {
                             for (rid, sender) in senders {
-                                if rid == id {
-                                    continue;
+                                if rid != id {
+                                    let _ =
+                                        sender.send(DatabaseMessage::WebMessage(WebMessage::new(
+                                            Message::new(chat_sender, content),
+                                            timestamp,
+                                            message_id.to_string(),
+                                        )));
                                 }
-                                let _ = sender.send(DatabaseMessage::Message(Message::new(
-                                    chat_sender,
-                                    content,
-                                )));
                             }
                         }
                     } else {
@@ -152,10 +147,9 @@ impl DbConnection {
                         let _ = sender.send(DatabaseMessage::Deleted(chat_id.clone()));
                         if let Some(senders) = self.email_senders.get(email) {
                             for (rid, sender) in senders {
-                                if rid == id {
-                                    continue;
+                                if rid != id {
+                                    let _ = sender.send(DatabaseMessage::Deleted(chat_id.clone()));
                                 }
-                                let _ = sender.send(DatabaseMessage::Deleted(chat_id.clone()));
                             }
                         }
                     } else {
@@ -294,7 +288,6 @@ impl DbConnection {
         statement.bind_iter([(1, email), (2, chat_id)]).unwrap();
         let mut messages = Vec::new();
         for result in statement.into_iter() {
-            println!("has result");
             if let Ok(row) = result {
                 let sender = row.read::<&str, _>("sender");
                 let content = row.read::<&str, _>("content");
@@ -306,7 +299,6 @@ impl DbConnection {
                 println!("is not ok");
             }
         }
-        println!("{:?}", messages);
         messages
     }
 

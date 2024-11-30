@@ -12,6 +12,7 @@ pub enum DatabaseMessage {
     UserInfo(UserInfo),
     Deleted(String),
     NewChat(String),
+    WebMessage(WebMessage),
     Ok,
     Err,
 }

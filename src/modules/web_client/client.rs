@@ -67,7 +67,6 @@ impl WebClient {
                 return None;
             }
         } else {
-            println!("NOT OK \n{:?}\n", request);
             return None;
         }
     }
