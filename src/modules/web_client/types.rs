@@ -69,7 +69,7 @@ pub struct Messages {
     pub answer_tokens: u64,
     used_tokens: u64,
     pub max_tokens: u64,
-    messages: Vec<WebMessage>,
+    pub messages: Vec<WebMessage>,
 }
 
 impl Messages {
@@ -141,4 +141,111 @@ impl UserInfo {
     pub fn new(email: String, name: String, token: String) -> Self {
         Self { email, name, token }
     }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum SocketMessage {
+    Deleted(String),
+    NewChat(String),
+    Message(Message),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ClientMessage {
+    kind: String,
+    pub body: ClientMessageKind,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ClientMessageKind {
+    #[serde(rename = "login")]
+    Login(Login),
+    #[serde(rename = "new_message")]
+    NewMessage(NewMessage),
+    #[serde(rename = "new_chat")]
+    NewChat(NewChat),
+    #[serde(rename = "delete_chat")]
+    DeleteChat(DeleteChat),
+    #[serde(rename = "get_chats")]
+    GetChats(String),
+    #[serde(rename = "get_chat")]
+    GetChat(GetChat),
+    #[serde(rename = "register")]
+    Register(Register),
+    #[serde(rename = "get_audio")]
+    GetAudio(GetAudio),
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Login {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct NewMessage {
+    pub token: String,
+    pub chat_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct NewChat {
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DeleteChat {
+    pub token: String,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetAudio {
+    pub token: String,
+    pub message_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct ValidateToken {
+    pub token: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct GetChat {
+    pub token: String,
+    pub chat_id: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Register {
+    pub email: String,
+    pub password: String,
+    pub name: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct AudioInfo {
+    pub message_id: String,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub enum ServerResponse {
+    #[serde(rename = "token")]
+    Token(String),
+    #[serde(rename = "user_info")]
+    UserInfo(UserInfo),
+    #[serde(rename = "chat_id")]
+    ChatId(String),
+    #[serde(rename = "message")]
+    Message(WebMessage),
+    #[serde(rename = "chats")]
+    Chats(Vec<String>),
+    #[serde(rename = "messages")]
+    Messages(Vec<WebMessage>),
+    #[serde(rename = "audio")]
+    Audio(AudioInfo),
+    #[serde(rename = "deleted")]
+    Deleted(String),
 }

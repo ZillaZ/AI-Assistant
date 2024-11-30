@@ -17,6 +17,7 @@ enum ValidationError {
 pub struct DbConnection {
     connection: Connection,
     senders: HashMap<String, Sender<DatabaseMessage>>,
+    email_senders: HashMap<String, HashMap<String, Sender<DatabaseMessage>>>,
     receiver: Receiver<NetworkMessage>,
     nreceiver: Receiver<String>,
     receiver_sender: Sender<Receiver<DatabaseMessage>>,
@@ -33,6 +34,7 @@ impl DbConnection {
             nreceiver,
             receiver_sender,
             senders: HashMap::new(),
+            email_senders: HashMap::new(),
             connection: Connection::open("database").unwrap(),
         }
     }
@@ -74,17 +76,27 @@ impl DbConnection {
                 NetworkMessage::TokenValidation(ref id, ref token) => {
                     let sender = self.senders.get(id).unwrap();
                     let email = self.validate_token(token);
-                    println!("{:?}", email);
                     if let Some(email) = email {
-                        let _ = sender.send(DatabaseMessage::Email(email));
+                        let _ = sender.send(DatabaseMessage::Email(email.clone()));
+                        let entry = self.email_senders.entry(email).or_insert(HashMap::new());
+                        entry.insert(id.to_string(), sender.clone());
                     } else {
                         let _ = sender.send(DatabaseMessage::Err);
                     }
                 }
                 NetworkMessage::NewChat(ref id, ref email) => {
                     let sender = self.senders.get(id).unwrap();
-                    let id = self.new_chat(email);
-                    let _ = sender.send(DatabaseMessage::Messages(id, Vec::new()));
+                    let chat_id = self.new_chat(email);
+                    let _ = sender.send(DatabaseMessage::Messages(chat_id.clone(), Vec::new()));
+                    if let Some(senders) = self.email_senders.get(email) {
+                        for (rid, sender) in senders {
+                            if rid == id {
+                                continue;
+                            }
+                            let _ =
+                                sender.send(DatabaseMessage::Messages(chat_id.clone(), Vec::new()));
+                        }
+                    }
                 }
                 NetworkMessage::ChatRequest(ref id, ref token, ref chat_id) => {
                     let sender = self.senders.get(id).unwrap();
@@ -111,6 +123,17 @@ impl DbConnection {
                         let timestamp =
                             self.new_chat_message(email, chat_sender, chat_id, content, message_id);
                         let _ = sender.send(DatabaseMessage::Timestamp(timestamp));
+                        if let Some(senders) = self.email_senders.get(email) {
+                            for (rid, sender) in senders {
+                                if rid == id {
+                                    continue;
+                                }
+                                let _ = sender.send(DatabaseMessage::Message(Message::new(
+                                    chat_sender,
+                                    content,
+                                )));
+                            }
+                        }
                     } else {
                         let _ = sender.send(DatabaseMessage::Err);
                     }
@@ -126,7 +149,15 @@ impl DbConnection {
                     if let Some(ref email) = email {
                         self.delete_chat(email, chat_id);
                         self.delete_messages(email, chat_id);
-                        let _ = sender.send(DatabaseMessage::Ok);
+                        let _ = sender.send(DatabaseMessage::Deleted(chat_id.clone()));
+                        if let Some(senders) = self.email_senders.get(email) {
+                            for (rid, sender) in senders {
+                                if rid == id {
+                                    continue;
+                                }
+                                let _ = sender.send(DatabaseMessage::Deleted(chat_id.clone()));
+                            }
+                        }
                     } else {
                         let _ = sender.send(DatabaseMessage::Err);
                     }
@@ -144,8 +175,8 @@ impl DbConnection {
                 NetworkMessage::GetMessage(ref id, ref message_id) => {
                     let sender = self.senders.get(id).unwrap();
                     let result = self.get_message(message_id);
-                    if let Some(message) = result {
-                        let _ = sender.send(DatabaseMessage::Message(message));
+                    if let Some(ref message) = result {
+                        let _ = sender.send(DatabaseMessage::Message(Message::new("", message)));
                         return;
                     }
                     let _ = sender.send(DatabaseMessage::Err);
@@ -157,7 +188,6 @@ impl DbConnection {
                         let _ = sender.send(DatabaseMessage::AudioPath(path));
                         return;
                     }
-                    println!("GONNA USE NEW");
                     let _ = sender.send(DatabaseMessage::Err);
                 }
                 NetworkMessage::RecordAudioPath(ref message_id, ref path) => {
@@ -201,6 +231,7 @@ impl DbConnection {
     }
 
     fn get_message(&self, message_id: &str) -> Option<String> {
+        println!("{message_id}");
         let query = "select content from Messages where id = ?";
         let mut statement = self.connection.prepare(query).unwrap();
         statement.bind((1, message_id)).unwrap();

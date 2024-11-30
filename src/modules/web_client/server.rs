@@ -4,8 +4,13 @@ use serde_json::json;
 use sha2::Digest;
 use std::{
     io::{ErrorKind, Read, Write},
-    net::{TcpListener, TcpStream},
     sync::mpsc::{Receiver, Sender},
+};
+
+use websocket::{
+    stream::sync::TcpStream,
+    sync::{Client, Reader, Server, Writer},
+    OwnedMessage,
 };
 
 pub struct WebServer {
@@ -28,25 +33,30 @@ impl WebServer {
     }
 
     pub fn update(&mut self) {
-        let listener = TcpListener::bind("0.0.0.0:8080").expect("Unable to start tcp listener");
-        while let Ok((stream, addr)) = listener.accept() {
-            let _ = self.sender.send(addr.to_string());
-            let receiver = self.receiver.recv().unwrap();
-            let mut web_connection = WebConnection::new(
-                stream,
-                addr.to_string(),
-                self.network_sender.clone(),
-                receiver,
-            );
-            std::thread::spawn(move || {
-                web_connection.update();
-            });
+        let mut listener = Server::bind("0.0.0.0:8080").expect("Unable to start WebSockets server");
+        while let Ok(stream) = listener.accept() {
+            if let Ok(client) = stream.accept() {
+                let (reader, writer) = client.split().unwrap();
+                println!("SUCCESS");
+                let addr = uuid::Uuid::new_v4().to_string();
+                let _ = self.sender.send(addr.to_string());
+                let receiver = self.receiver.recv().unwrap();
+                let mut web_connection = WebConnection::new(
+                    writer,
+                    addr.to_string(),
+                    self.network_sender.clone(),
+                    receiver,
+                );
+                std::thread::spawn(move || {
+                    web_connection.update(reader);
+                });
+            }
         }
     }
 }
 
 pub struct WebConnection {
-    stream: TcpStream,
+    writer: Writer<TcpStream>,
     addr: String,
     sender: Sender<NetworkMessage>,
     receiver: Receiver<DatabaseMessage>,
@@ -55,14 +65,14 @@ pub struct WebConnection {
 
 impl WebConnection {
     pub fn new(
-        stream: TcpStream,
+        writer: Writer<TcpStream>,
         addr: String,
         sender: Sender<NetworkMessage>,
         receiver: Receiver<DatabaseMessage>,
     ) -> Self {
         let web_client = WebClient::new();
         Self {
-            stream,
+            writer,
             addr,
             sender,
             receiver,
@@ -70,84 +80,91 @@ impl WebConnection {
         }
     }
 
-    pub fn update(&mut self) {
-        let data = read(&mut self.stream);
-        let mut headers = [httparse::EMPTY_HEADER; 64];
-        let mut req = httparse::Request::new(&mut headers);
-        if let Ok(_) = req.parse(&data) {
-            self.handle_request(&req, &data);
-        } else {
-            let mut response = httparse::Response::new(&mut []);
-            response.code = Some(400);
-            response.reason = Some("Invalid Request");
-            let response = response_to_bytes(response, None::<String>);
-            let _ = self.stream.write(&response);
-        }
-    }
-
-    fn handle_request(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        if let Some(method) = request.method {
-            if self.handle_cors(request) {
-                return;
-            }
-            if let Some(path) = request.path {
-                let slice = path.split("/").collect::<Vec<&str>>();
-                if let Some(path) = slice.get(1) {
-                    match format!("{method} {path}").as_str() {
-                        "GET chat" => self.get_chat(request),
-                        "POST new_chat" => self.new_chat(request),
-                        "POST new_message" => self.send_message(request, data),
-                        "POST login" => self.login(request, data),
-                        "GET chats" => self.get_chats(request),
-                        "DELETE delete_chat" => self.delete_chat(request, data),
-                        "POST register" => self.register_user(request, data),
-                        "GET audio" => self.get_audio(request, data),
-                        _ => self.handle_invalid_endpoint(),
-                    }
-                } else {
-                    self.generic_error(400, "Bad Request");
+    pub fn update(&mut self, mut reader: Reader<TcpStream>) {
+        for message in reader.incoming_messages() {
+            if let Ok(message) = message {
+                if let OwnedMessage::Text(data) = message {
+                    let mut headers = [httparse::EMPTY_HEADER; 64];
+                    let req = httparse::Request::new(&mut headers);
+                    //self.receive_messages();
+                    self.handle_request(&req, &data);
                 }
             }
         }
     }
 
-    fn get_audio(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        if let Some(token) = get_header(&request.headers, "Token") {
-            let _ = self
-                .sender
-                .send(NetworkMessage::TokenValidation(self.addr.clone(), token));
-            let response = self.receiver.recv().unwrap();
-            match response {
-                DatabaseMessage::Email(ref email) => {
-                    let body = String::from_utf8_lossy(data);
-                    let id = get_request_body(body.to_string());
-                    let _ = self
-                        .sender
-                        .send(NetworkMessage::GetMessage(self.addr.clone(), id.clone()));
-                    let response = self.receiver.recv().unwrap();
-                    match response {
-                        DatabaseMessage::Message(ref message) => {
-                            let data = self.get_audio_file(id, message);
-                            let data_len = data.len().to_string();
-                            let headers = vec![
-                                ("Access-Control-Allow-Origin", "*"),
-                                ("Access-Control-Allow-Headers", "*"),
-                                ("Content-Length", data_len.as_str()),
-                            ];
-                            let mut headers = new_headers(&headers);
-                            let mut response = httparse::Response::new(&mut headers);
-                            response.code = Some(200);
-                            response.reason = Some("OK");
-                            let response = response_to_bytes(response, Some(data));
-                            let _ = self.stream.write_all(&response);
-                        }
-                        _ => self.generic_error(403, "Forbidden"),
-                    }
+    fn receive_messages(&mut self) {
+        while let Ok(message) = self.receiver.try_recv() {
+            match message {
+                DatabaseMessage::Message(message) => {
+                    let message = json!(SocketMessage::Message(message)).to_string();
+                    let _ = self.writer.send_message(&OwnedMessage::Text(message));
                 }
-                _ => self.generic_error(401, "Unauthorized"),
+                DatabaseMessage::Deleted(chat_id) => {
+                    let message = json!(SocketMessage::Deleted(chat_id)).to_string();
+                    let _ = self.writer.send_message(&OwnedMessage::Text(message));
+                }
+                DatabaseMessage::NewChat(chat_id) => {
+                    let message = json!(SocketMessage::NewChat(chat_id)).to_string();
+                    let _ = self.writer.send_message(&OwnedMessage::Text(message));
+                }
+                message => todo!("{:?}", message),
+            }
+        }
+    }
+
+    fn handle_request(&mut self, request: &httparse::Request, data: &str) {
+        if let Ok(message) = serde_json::from_str::<ClientMessage>(data) {
+            println!("MESSAGE: {:?}", message);
+            match message.body {
+                ClientMessageKind::Login(login) => {
+                    self.login(login);
+                }
+                ClientMessageKind::NewChat(new_chat) => {
+                    self.new_chat(new_chat);
+                }
+                ClientMessageKind::DeleteChat(delete_chat) => {
+                    self.delete_chat(delete_chat);
+                }
+                ClientMessageKind::NewMessage(new_message) => self.send_message(new_message),
+                ClientMessageKind::GetChats(ref token) => self.get_chats(token),
+                ClientMessageKind::GetChat(get_chat) => self.get_chat(get_chat),
+                ClientMessageKind::Register(register) => self.register_user(register),
+                ClientMessageKind::GetAudio(get_audio) => self.get_audio(get_audio),
             }
         } else {
-            self.generic_error(400, "Bad Request");
+            println!("not message: {data}");
+        }
+    }
+
+    fn get_audio(&mut self, get_audio: GetAudio) {
+        let _ = self.sender.send(NetworkMessage::TokenValidation(
+            self.addr.clone(),
+            get_audio.token,
+        ));
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::Email(ref _email) => {
+                let _ = self.sender.send(NetworkMessage::GetMessage(
+                    self.addr.clone(),
+                    get_audio.message_id.to_string(),
+                ));
+                let response = self.receiver.recv().unwrap();
+                match response {
+                    DatabaseMessage::Message(ref message) => {
+                        let message = message.content.as_ref().unwrap();
+                        let data = self.get_audio_file(get_audio.message_id.to_string(), message);
+                        let response = ServerResponse::Audio(AudioInfo {
+                            message_id: get_audio.message_id.to_string(),
+                            content: data,
+                        });
+                        let response = json!(response).to_string();
+                        let _ = self.writer.send_message(&OwnedMessage::Text(response));
+                    }
+                    _ => self.generic_error(403, "Forbidden"),
+                }
+            }
+            _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
@@ -170,215 +187,114 @@ impl WebConnection {
         }
     }
 
-    fn register_user(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        let body = String::from_utf8_lossy(data);
-        let credentials = get_request_body(body.to_string());
-        let slice = credentials.split("\n").collect::<Vec<&str>>();
-        if slice.len() != 3 {
-            self.generic_error(400, "Bad Request");
-            return;
-        }
-        let name = slice[0];
-        let email = slice[1];
-        let password = slice[2];
-        let email = email.trim();
-        let password = password.trim();
-        if email.trim().len() < 2 || password.trim().len() < 8 {
-            self.generic_error(400, "Bad Request");
-            return;
-        }
+    fn register_user(&mut self, register: Register) {
         let _ = self.sender.send(NetworkMessage::RegisterUser(
             self.addr.clone(),
-            name.to_string(),
-            email.to_string(),
-            password.to_string(),
+            register.name.to_string(),
+            register.email.to_string(),
+            register.password.to_string(),
         ));
         let response = self.receiver.recv().unwrap();
         match response {
             DatabaseMessage::Token(ref token) => {
-                let headers = vec![
-                    ("Access-Control-Allow-Origin", "*"),
-                    ("Access-Control-Allow-Headers", "*"),
-                ];
-                let mut headers = new_headers(&headers);
-                let mut response = httparse::Response::new(&mut headers);
-                response.code = Some(200);
-                response.reason = Some("OK");
-                let body = UserInfo::new(email.to_string(), name.to_string(), token.to_string());
-                let body = json!(body).to_string();
-                let response = response_to_bytes(response, Some(body));
-                let _ = self.stream.write_all(&response);
+                let info = UserInfo::new(
+                    register.email.to_string(),
+                    register.name.to_string(),
+                    token.to_string(),
+                );
+                let response = ServerResponse::UserInfo(info);
+                let response = json!(response).to_string();
+                let _ = self.writer.send_message(&OwnedMessage::Text(response));
             }
             _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
-    fn delete_chat(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        let token = get_header(&request.headers, "Token");
-        if let Some(token) = token {
-            let chat_id = get_request_body(String::from_utf8_lossy(data).to_string());
-            let _ = self.sender.send(NetworkMessage::DeleteChat(
-                self.addr.clone(),
-                token.to_string(),
-                chat_id,
-            ));
-            let response = self.receiver.recv().unwrap();
-            match response {
-                DatabaseMessage::Ok => {
-                    let headers = vec![
-                        ("Access-Control-Allow-Origin", "*"),
-                        ("Access-Control-Allow-Headers", "*"),
-                    ];
-                    let mut headers = new_headers(&headers);
-                    let mut response = httparse::Response::new(&mut headers);
-                    response.code = Some(200);
-                    response.reason = Some("OK");
-                    let response = response_to_bytes(response, None::<String>);
-                    let _ = self.stream.write_all(&response);
-                }
-                _ => self.generic_error(404, "Not Found"),
+    fn delete_chat(&mut self, delete_chat: DeleteChat) {
+        let _ = self.sender.send(NetworkMessage::DeleteChat(
+            self.addr.clone(),
+            delete_chat.token,
+            delete_chat.chat_id,
+        ));
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::Deleted(chat_id) => {
+                let response = ServerResponse::Deleted(chat_id);
+                let response = json!(response).to_string();
+                let _ = self.writer.send_message(&OwnedMessage::Text(response));
             }
-        } else {
-            self.generic_error(400, "Bad Request");
+            _ => self.generic_error(404, "Not Found"),
         }
     }
 
-    fn handle_cors(&mut self, request: &httparse::Request) -> bool {
-        if let Some(method) = request.method {
-            if method != "OPTIONS" {
-                return false;
-            }
-            println!("RECEIVED CORS REQUEST");
-            let headers = vec![
-                ("Access-Control-Allow-Origin", "*"),
-                ("Access-Control-Allow-Headers", "*"),
-                ("Access-Control-Allow-Methods", "*"),
-            ];
-            let mut headers = new_headers(&headers);
-            let mut response = httparse::Response::new(&mut headers);
-            response.code = Some(200);
-            response.reason = Some("OK");
-            let response = response_to_bytes(response, None::<String>);
-            let _ = self.stream.write_all(&response);
-            return true;
-        }
-        false
-    }
-
-    fn get_chats(&mut self, request: &httparse::Request) {
-        if let Some(token) = get_header(&request.headers, "Token") {
-            let _ = self
-                .sender
-                .send(NetworkMessage::TokenValidation(self.addr.clone(), token));
-            let response = self.receiver.recv().unwrap();
-            match response {
-                DatabaseMessage::Email(email) => {
-                    let message = NetworkMessage::GetChats(self.addr.clone(), email);
-                    let _ = self.sender.send(message);
-                    let response = self.receiver.recv().unwrap();
-                    match response {
-                        DatabaseMessage::Chats(ref chats) => {
-                            let chats = chats.join("\n");
-                            let chats_len = chats.len().to_string();
-                            let headers = vec![
-                                ("Access-Control-Allow-Origin", "*"),
-                                ("Content-Length", chats_len.as_str()),
-                                ("Content-Type", "text/plain"),
-                            ];
-                            let mut headers = new_headers(&headers);
-                            let mut response = httparse::Response::new(&mut headers);
-                            response.code = Some(200);
-                            response.reason = Some("OK");
-                            let response = response_to_bytes(response, Some(chats));
-                            let _ = self.stream.write(&response);
-                        }
-                        _ => self.generic_error(500, "Internal Server Error"),
+    fn get_chats(&mut self, token: &str) {
+        let _ = self.sender.send(NetworkMessage::TokenValidation(
+            self.addr.clone(),
+            token.to_string(),
+        ));
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::Email(email) => {
+                let message = NetworkMessage::GetChats(self.addr.clone(), email);
+                let _ = self.sender.send(message);
+                let response = self.receiver.recv().unwrap();
+                match response {
+                    DatabaseMessage::Chats(chats) => {
+                        let response = ServerResponse::Chats(chats);
+                        let response = json!(response).to_string();
+                        let _ = self.writer.send_message(&OwnedMessage::Text(response));
                     }
+                    _ => self.generic_error(500, "Internal Server Error"),
                 }
-                _ => self.generic_error(401, "Unauthorized"),
             }
-        } else {
-            self.generic_error(400, "Bad Request");
+            _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
-    fn login(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        println!("received login request");
-        let content = get_request_body(String::from_utf8_lossy(data).to_string());
-        let slice = content
-            .split("\n")
-            .filter(|x| !x.is_empty())
-            .collect::<Vec<&str>>();
-        if slice.len() != 2 {
-            self.generic_error(400, "Bad Request");
-            return;
-        }
-        let email = slice[0];
-        let password = slice[1];
+    fn login(&mut self, login: Login) {
         let mut hasher = sha2::Sha256::new();
-        hasher.update(password.trim());
+        hasher.update(login.password.trim());
         let finalized = &hasher.finalize();
         let password_hash = hex::encode(finalized);
 
         let _ = self.sender.send(NetworkMessage::LoginRequest(
             self.addr.clone(),
-            email.to_string(),
+            login.email,
             password_hash.to_string(),
         ));
         let response = self.receiver.recv().unwrap();
         match response {
-            DatabaseMessage::UserInfo(ref info) => {
-                let token = format!("Token={}", info.token);
-                let headers = vec![
-                    ("Access-Control-Allow-Origin", "*"),
-                    ("Access-Control-Expose-Headers", "*"),
-                    ("Cookie", &token),
-                ];
-                let mut headers = new_headers(&headers);
-                let mut response = httparse::Response::new(&mut headers);
-                response.code = Some(200);
-                response.reason = Some("OK");
-                let body = json!(info).to_string();
-                let response = response_to_bytes(response, Some(body));
-                let _ = self.stream.write_all(&response);
+            DatabaseMessage::UserInfo(info) => {
+                let response = ServerResponse::UserInfo(info);
+                let response = json!(response).to_string();
+                let _ = self.writer.send_message(&OwnedMessage::Text(response));
             }
             _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
-    fn new_chat(&mut self, request: &httparse::Request) {
-        if let Some(token) = get_header(&request.headers, "Token") {
-            let _ = self
-                .sender
-                .send(NetworkMessage::TokenValidation(self.addr.clone(), token));
-            let response = self.receiver.recv().unwrap();
-            match response {
-                DatabaseMessage::Email(email) => {
-                    let message = NetworkMessage::NewChat(self.addr.clone(), email);
-                    let _ = self.sender.send(message);
-                    let response = self.receiver.recv().unwrap();
-                    match response {
-                        DatabaseMessage::Messages(id, _) => {
-                            let id_str = id.len().to_string();
-                            let headers = vec![
-                                ("Content-Length", id_str.as_str()),
-                                ("Content-Type", "text/plain"),
-                                ("Access-Control-Allow-Origin", "*"),
-                            ];
-                            let mut headers = new_headers(&headers);
-                            let mut response = httparse::Response::new(&mut headers);
-                            response.code = Some(200);
-                            response.reason = Some("OK");
-                            let response = response_to_bytes(response, Some(id));
-                            let _ = self.stream.write(&response);
-                        }
-                        _ => self.generic_error(403, "Forbidden"),
+    fn new_chat(&mut self, new_chat: NewChat) {
+        let _ = self.sender.send(NetworkMessage::TokenValidation(
+            self.addr.clone(),
+            new_chat.token,
+        ));
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::Email(email) => {
+                let message = NetworkMessage::NewChat(self.addr.clone(), email);
+                let _ = self.sender.send(message);
+                let response = self.receiver.recv().unwrap();
+                println!("RESPONSE IS {:?}", response);
+                match response {
+                    DatabaseMessage::Messages(id, _) => {
+                        let response = ServerResponse::ChatId(id);
+                        let response = json!(response).to_string();
+                        let _ = self.writer.send_message(&OwnedMessage::Text(response));
                     }
+                    _ => self.generic_error(403, "Forbidden"),
                 }
-                _ => self.generic_error(401, "Unauthorized"),
             }
-        } else {
-            self.generic_error(400, "Bad Request");
+            _ => self.generic_error(401, "Unauthorized"),
         }
     }
 
@@ -388,119 +304,79 @@ impl WebConnection {
         let mut response = httparse::Response::new(&mut headers);
         response.code = Some(code);
         response.reason = Some(reason);
-        let response = response_to_bytes(response, None::<String>);
-        let _ = self.stream.write_all(&response);
+        let response = response_to_string(response, None::<String>);
+        let _ = self.writer.send_message(&OwnedMessage::Text(response));
     }
 
-    fn get_chat(&mut self, request: &httparse::Request) {
-        let path = request.path.unwrap();
-        let slice = path.split("/").collect::<Vec<&str>>();
-        if let Some(chat_id) = slice.get(2) {
-            let token = get_header(&request.headers, "Token");
-            if let Some(token) = token {
-                let _ = self.sender.send(NetworkMessage::ChatRequest(
-                    self.addr.clone(),
-                    token,
-                    chat_id.to_string(),
-                ));
-                let response = self.receiver.recv().unwrap();
+    fn get_chat(&mut self, get_chat: GetChat) {
+        let _ = self.sender.send(NetworkMessage::ChatRequest(
+            self.addr.clone(),
+            get_chat.token,
+            get_chat.chat_id.to_string(),
+        ));
+        let response = self.receiver.recv().unwrap();
+        println!("RECEIVED INSIDE GET CHAT");
 
-                match response {
-                    DatabaseMessage::Messages(ref id, messages) => {
-                        let messages = Messages::new(messages);
-                        let body = json!(messages).to_string();
-                        let body_len = body.len().to_string();
-                        let headers = Vec::from([
-                            ("Access-Control-Allow-Origin", "*"),
-                            ("Content-Type", "application/json"),
-                            ("Content-Length", body_len.as_str()),
-                        ]);
-                        let mut headers = new_headers(&headers);
-                        let mut response = httparse::Response::new(&mut headers);
-                        response.code = Some(200);
-                        response.reason = Some("OK");
-                        let response = response_to_bytes(response, Some(body));
-                        let _ = self.stream.write_all(&response);
-                    }
-                    _ => self.generic_error(403, "Forbidden"),
-                }
-            } else {
-                self.generic_error(401, "Unauthorized");
+        match response {
+            DatabaseMessage::Messages(ref _id, messages) => {
+                let messages = Messages::new(messages).messages;
+                let response = ServerResponse::Messages(messages);
+                let response = json!(response).to_string();
+                let _ = self.writer.send_message(&OwnedMessage::Text(response));
             }
-        } else {
-            self.generic_error(400, "Bad Request");
+            _ => self.generic_error(403, "Forbidden"),
         }
     }
 
-    fn send_message(&mut self, request: &httparse::Request, data: &Vec<u8>) {
-        let path = request.path.unwrap();
-        let slice = path.split("/").collect::<Vec<&str>>();
-        if let Some(chat_id) = slice.get(2) {
-            let token = get_header(&request.headers, "Token");
-            if let Some(token) = token {
-                let content = get_request_body(String::from_utf8_lossy(data).to_string());
-                if content.trim().len() < 1 {
-                    self.generic_error(400, "Bad Request");
+    fn send_message(&mut self, new_message: NewMessage) {
+        if new_message.content.trim().len() < 1 {
+            self.generic_error(400, "Bad Request");
+            return;
+        }
+        let _ = self.sender.send(NetworkMessage::NewMessage(
+            self.addr.clone(),
+            new_message.token.clone(),
+            "user".to_string(),
+            new_message.chat_id.to_string(),
+            new_message.content.clone(),
+            uuid::Uuid::new_v4().to_string(),
+        ));
+        let message = Message::new("user", &new_message.content);
+        let response = self.receiver.recv().unwrap();
+        match response {
+            DatabaseMessage::Timestamp(timestamp) => {
+                if &self.web_client.chat_id != &new_message.chat_id {
+                    if let Some(messages) =
+                        self.retrieve_messages(&new_message.token, &new_message.chat_id)
+                    {
+                        self.web_client.load_context(messages);
+                        self.web_client.chat_id = new_message.chat_id.clone();
+                    }
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let message = WebMessage::new(message, timestamp, String::new());
+                let mut copy: Message = Message::new("", "");
+                let _ = copy;
+                if let Some(answer) = self.web_client.new_message(message) {
+                    copy = answer.clone();
+                    let _ = self.sender.send(NetworkMessage::NewMessage(
+                        self.addr.clone(),
+                        new_message.token,
+                        answer.role.as_ref().unwrap().clone(),
+                        new_message.chat_id.to_string(),
+                        answer.content.as_ref().unwrap().clone(),
+                        id.clone(),
+                    ));
+                    self.receiver.recv().unwrap();
+                } else {
+                    self.generic_error(502, "Bad Gateway");
                     return;
                 }
-                let _ = self.sender.send(NetworkMessage::NewMessage(
-                    self.addr.clone(),
-                    token.clone(),
-                    "user".to_string(),
-                    chat_id.to_string(),
-                    content.clone(),
-                    uuid::Uuid::new_v4().to_string(),
-                ));
-                let message = Message::new("user", &content);
-                let response = self.receiver.recv().unwrap();
-                match response {
-                    DatabaseMessage::Timestamp(timestamp) => {
-                        if &self.web_client.chat_id != chat_id {
-                            if let Some(messages) = self.retrieve_messages(&token, chat_id) {
-                                self.web_client.load_context(messages);
-                                self.web_client.chat_id = chat_id.to_string();
-                            }
-                        }
-                        let id = uuid::Uuid::new_v4().to_string();
-                        let message = WebMessage::new(message, timestamp, String::new());
-                        let mut copy: Message = Message::new("", "");
-                        let _ = copy;
-                        if let Some(answer) = self.web_client.new_message(message) {
-                            copy = answer.clone();
-                            let _ = self.sender.send(NetworkMessage::NewMessage(
-                                self.addr.clone(),
-                                token,
-                                answer.role.as_ref().unwrap().clone(),
-                                chat_id.to_string(),
-                                answer.content.as_ref().unwrap().clone(),
-                                id.clone(),
-                            ));
-                            self.receiver.recv().unwrap();
-                        } else {
-                            self.generic_error(502, "Bad Gateway");
-                            return;
-                        }
-                        let body = json!(WebMessage::new(copy, timestamp, id)).to_string();
-                        let body_len = body.as_bytes().len().to_string();
-                        let headers = vec![
-                            ("Access-Control-Allow-Origin", "*"),
-                            ("Content-Type", "application/json"),
-                            ("Content-Length", body_len.as_str()),
-                        ];
-                        let mut headers = new_headers(&headers);
-                        let mut response = httparse::Response::new(&mut headers);
-                        response.code = Some(200);
-                        response.reason = Some("OK");
-                        let response = response_to_bytes(response, Some(body));
-                        let _ = self.stream.write_all(&response);
-                    }
-                    _ => self.generic_error(403, "Forbidden"),
-                }
-            } else {
-                self.generic_error(401, "Unauthorized");
+                let response = ServerResponse::Message(WebMessage::new(copy, timestamp, id));
+                let response = json!(response).to_string();
+                let _ = self.writer.send_message(&OwnedMessage::Text(response));
             }
-        } else {
-            self.generic_error(400, "Bad Request");
+            _ => self.generic_error(403, "Forbidden"),
         }
     }
 
@@ -516,7 +392,7 @@ impl WebConnection {
         ));
         let response = self.receiver.recv().unwrap();
         match response {
-            DatabaseMessage::Messages(id, messages) => Some(Messages::new(messages)),
+            DatabaseMessage::Messages(_id, messages) => Some(Messages::new(messages)),
             _ => None,
         }
     }

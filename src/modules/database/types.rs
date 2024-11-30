@@ -1,14 +1,17 @@
 use crate::modules::web_client::types::*;
 
+#[derive(Debug)]
 pub enum DatabaseMessage {
     Chats(Vec<String>),
     Messages(String, Vec<WebMessage>),
     Email(String),
     Token(String),
     Timestamp(u64),
-    Message(String),
+    Message(Message),
     AudioPath(String),
     UserInfo(UserInfo),
+    Deleted(String),
+    NewChat(String),
     Ok,
     Err,
 }

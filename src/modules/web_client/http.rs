@@ -17,7 +17,7 @@ pub fn new_headers<'a>(headers: &'a Vec<(&'a str, &'a str)>) -> Vec<httparse::He
         .collect::<Vec<httparse::Header>>()
 }
 
-pub fn response_to_bytes<T: AsRef<[u8]>>(response: httparse::Response, body: Option<T>) -> Vec<u8> {
+pub fn response_to_string<T: AsRef<[u8]>>(response: httparse::Response, body: Option<T>) -> String {
     let code = format!(
         "HTTP/1.1 {} {}\n",
         response.code.unwrap(),
@@ -43,19 +43,5 @@ pub fn response_to_bytes<T: AsRef<[u8]>>(response: httparse::Response, body: Opt
         response.push("\n".as_bytes().to_vec());
         response.push(body.as_ref().to_vec());
     }
-    response.concat()
-}
-
-pub fn get_request_body(request: String) -> String {
-    let mut flag = false;
-    let mut content = Vec::new();
-    for line in request.lines() {
-        if flag {
-            content.push(line);
-        }
-        if line.trim().is_empty() {
-            flag = true;
-        }
-    }
-    content.join("\n")
+    String::from_utf8_lossy(&response.concat()).to_string()
 }
